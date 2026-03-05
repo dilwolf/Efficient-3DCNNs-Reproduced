@@ -1,4 +1,4 @@
-# Efficient-3DCNNs-Improved: An Improved and Extended codebase of original [Efficient-3DCNNs](https://github.com/okankop/Efficient-3DCNNs)
+# Efficient-3DCNNs-Reproduced: An Improved and Extended codebase of original [Efficient-3DCNNs](https://github.com/okankop/Efficient-3DCNNs)
 
 > ⚠️ **Work in Progress** — This repository is currently under active development. Training is in progress and results will be shared soon. Stay tuned!
 
