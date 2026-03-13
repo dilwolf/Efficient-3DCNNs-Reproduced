@@ -4,7 +4,9 @@ Efficient frame-based Kinetics dataset loader
 
 import os
 import cv2
+import lmdb
 import torch
+import struct
 import pickle
 import random
 import logging
@@ -16,7 +18,6 @@ from typing import Tuple, Optional
 # Setup logging
 # logging.basicConfig(level=logging.INFO)
 # logger = logging.getLogger(__name__)
-
 
 class Kinetics(data.Dataset):
     """
@@ -60,160 +61,124 @@ class Kinetics(data.Dataset):
         # logger.info(f"Dataset initialized: {len(self.samples)} samples from {len(self.class_to_idx)} classes")
     
     def _build_dataset(self):
-        """Build dataset by scanning directory structure, or load from cache if available."""
-        
+        """Build dataset by scanning .lmdb files, or load from cache if available."""
+
         if not self.path.exists():
             raise FileNotFoundError(f"Root path does not exist: {self.path}")
-        
+
         cache_path = self.path / "dataset_cache.pkl"
-        
-        # Load from cache if available
+
         if cache_path.exists():
             with open(cache_path, 'rb') as f:
                 cached = pickle.load(f)
                 self.samples      = cached['samples']
                 self.class_to_idx = cached['class_to_idx']
                 self.idx_to_class = cached['idx_to_class']
-        else:
-            # Get all class directories
-            class_dirs = sorted([d for d in self.path.iterdir() if d.is_dir()])
-            
-            if not class_dirs:
-                raise ValueError(f"No class directories found in {self.path}")
-            
-            if len(class_dirs) != self.num_classes:
-                raise ValueError(f"The number of class folders: {len(class_dirs)} is not equal to expected number of classes: {self.num_classes}")
-            
-            # Create class mappings
-            self.class_to_idx = {cls_dir.name: idx for idx, cls_dir in enumerate(class_dirs)}
-            self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
-            
-            # Scan each class directory
-            for class_dir in class_dirs:
-                class_name = class_dir.name
-                class_idx = self.class_to_idx[class_name]
-                
-                # Get all video directories within this class
-                video_dirs = sorted([v for v in class_dir.iterdir() if v.is_dir()])
-                
-                for video_dir in video_dirs:
-                    self._process_video_directory(video_dir, class_idx)
-            
-            if not self.samples:
-                raise ValueError(f"No valid samples found in {self.path}")
-            
-            # Save cache for next run
-            with open(cache_path, 'wb') as f:
-                pickle.dump({
-                    'samples':      self.samples,
-                    'class_to_idx': self.class_to_idx,
-                    'idx_to_class': self.idx_to_class
-                }, f)
-        
-    def _get_frame_range(self, video_dir: str):
-        min_idx = None
-        max_idx = None
+            return
 
-        with os.scandir(video_dir) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(".jpg"):
-                    num = int(entry.name[:-4])
+        class_dirs = sorted([d for d in self.path.iterdir() if d.is_dir()])
 
-                    if min_idx is None:
-                        min_idx = num
-                        max_idx = num
-                    else:
-                        if num < min_idx:
-                            min_idx = num
-                        elif num > max_idx:
-                            max_idx = num
+        if not class_dirs:
+            raise ValueError(f"No class directories found in {self.path}")
 
-        if min_idx is None:
-            raise IOError(f"No frames found in {video_dir}")
+        if len(class_dirs) != self.num_classes:
+            raise ValueError(
+                f"Found {len(class_dirs)} class folders, expected {self.num_classes}"
+            )
 
-        return min_idx, max_idx
+        self.class_to_idx = {d.name: idx for idx, d in enumerate(class_dirs)}
+        self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
+
+        for class_dir in class_dirs:
+            class_idx = self.class_to_idx[class_dir.name]
+            for lmdb_path in sorted(class_dir.glob("*.lmdb")):
+                self._process_video_lmdb(lmdb_path, class_idx)
+
+        if not self.samples:
+            raise ValueError(f"No valid samples found in {self.path}")
+
+        with open(cache_path, 'wb') as f:
+            pickle.dump({
+                'samples':      self.samples,
+                'class_to_idx': self.class_to_idx,
+                'idx_to_class': self.idx_to_class,
+            }, f)
+            
+    def _lmdb_frame_key(self, index: int) -> bytes:
+        return f"{index:05d}".encode("ascii")
+
+    def _read_lmdb_len(self, lmdb_path: str) -> int:
+        """Open LMDB briefly just to read __len__, then close."""
+        env = lmdb.open(lmdb_path, readonly=True, lock=False, meminit=False)
+        with env.begin(write=False) as txn:
+            n = struct.unpack(">I", txn.get(b"__len__"))[0]
+        env.close()
+        return n
     
-    def load_frames(self, frame_paths: list[str]) -> list[np.ndarray]:
+    def load_frames(self, lmdb_path: str, indices: list[int]) -> list[np.ndarray]:
         """
-        Load multiple frames efficiently using OpenCV
-        
-        Args:
-            frame_paths: List of frame paths to load
-            
-        Returns:
-            List of numpy arrays (RGB format)
+        Read and decode only the requested frames from LMDB.
+        Raw JPEG buffers are released immediately after decoding.
         """
+        env = lmdb.open(
+            lmdb_path,
+            readonly=True,
+            lock=False,        # safe for concurrent readers
+            readahead=False,   # avoids polluting OS page cache on HDD
+            meminit=False,
+        )
         frames = []
-        
-        for path in frame_paths:
-            frame = cv2.imread(path)
-
-            if frame is None:
-                # logger.error(f"Image not found or unreadable: {path}")
-                raise IOError(f"Image not found or unreadable: {path}") # we need to catch and stop if the frame is not found
-
-            # convert to RGB color for augmentation later
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
-    
+        try:
+            with env.begin(write=False, buffers=True) as txn:
+                for fi in indices:
+                    buf = txn.get(self._lmdb_frame_key(fi))
+                    if buf is None:
+                        raise IOError(f"Frame key {fi:05d} not found in {lmdb_path}")
+                    arr = np.frombuffer(buf, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    del buf, arr
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(frame)
+        finally:
+            env.close()
         return frames
     
-    def _process_video_directory(self, video_dir: Path, class_idx: int):
-        """Process a single video directory and create samples"""
-        
-        # Get all frame paths
-        start_idx, end_idx = self._get_frame_range(video_dir)
-        n_frames = end_idx - start_idx + 1
-        effective_length = self.sample_duration * self.sampling_step
-        if n_frames < effective_length: # Skip if total frames is smaller than effective_length
-            return
-        
-        # Create samples based on sampling strategy
-        self.samples.append(
-            (str(video_dir), start_idx, end_idx, n_frames, class_idx)
-        )
-    
-    def _sample_paths(self, video_dir: str, n_frames: int, start_idx: int):
+    def _process_video_lmdb(self, lmdb_path: Path, class_idx: int):
+        """Read n_frames from LMDB metadata; skip if too short."""
+        n_frames = self._read_lmdb_len(str(lmdb_path))
 
+        effective_length = self.sample_duration * self.sampling_step
+        if n_frames < effective_length:
+            return
+
+        # samples tuple: (lmdb_path_str, n_frames, class_idx)
+        # n_frames cached here so __getitem__ never needs to open LMDB for metadata
+        self.samples.append((str(lmdb_path), n_frames, class_idx))
+    
+    def _sample_indices(self, n_frames: int) -> list[int]:
+        """Return 1-based frame indices for one clip."""
         effective_length = self.sample_duration * self.sampling_step
         max_start = n_frames - effective_length
 
-        if self.mode == "train":
-            offset = random.randint(0, max_start)
-        else:
-            offset = max_start // 2
+        offset = random.randint(0, max_start) if self.mode == "train" else max_start // 2
 
-        start_frame = start_idx + offset
-
-        return [
-            os.path.join(video_dir, f"{start_frame + i * self.sampling_step:05d}.jpg")
-            for i in range(self.sample_duration)
-        ]
+        return [offset + 1 + i * self.sampling_step for i in range(self.sample_duration)]
     
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
-        """
-        Get a video clip and its label
-        
-        Args:
-            index: Sample index
-            
-        Returns:
-            Tuple of (clip_tensor, label)
-            clip_tensor shape: (C, T, H, W)
-        """
-        video_dir, start_idx, _, n_frames, label = self.samples[index]
-        frame_paths_to_load = self._sample_paths(video_dir, n_frames, start_idx)
-        frames = self.load_frames(frame_paths_to_load)
-        
-        # Randomize parameters once per clip for temporal consistency
+    def __getitem__(self, index: int):
+        # n_frames comes from RAM (self.samples) — no LMDB metadata lookup
+        lmdb_path, n_frames, label = self.samples[index]
+
+        indices = self._sample_indices(n_frames)
+        frames  = self.load_frames(lmdb_path, indices)
+
         if hasattr(self.transform, 'randomize_parameters') and self.mode == 'train':
             self.transform.randomize_parameters()
-        
+
         frames = self.transform(frames)
         frames = [torch.from_numpy(np.ascontiguousarray(f)).permute(2, 0, 1) for f in frames]
-        
+
         clip = torch.stack(frames, dim=0).permute(1, 0, 2, 3)
-        
+
         return clip, label
     
     def __len__(self) -> int:
