@@ -1,12 +1,6 @@
 """
 Training pipeline for video classification on Kinetics.
 Compatible with PyTorch 2.5+ with AMP, torchrun DDP, and CosineAnnealingLR.
-
-Single GPU:
-    python main.py [args]
-
-Multi GPU:
-    torchrun --nproc_per_node=2 main.py [args]
 """
 
 import os
@@ -14,7 +8,7 @@ import json
 import time
 import logging
 import argparse
-
+import datetime
 import torch
 import torch.nn as nn
 from utils import util
@@ -37,9 +31,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+
 # Train epoch
-# ---------------------------------------------------------------------------
 
 def train_model(
     epoch: int,
@@ -127,9 +120,8 @@ def train_model(
         })
 
 
-# ---------------------------------------------------------------------------
+
 # Validation epoch
-# ---------------------------------------------------------------------------
 
 def eval_model(
     epoch: int,
@@ -138,8 +130,10 @@ def eval_model(
     criterion: nn.Module,
     opt,
     val_logger: util.Logger,
-    is_main: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
 ):
+    is_main = rank == 0
     if is_main:
         logger.info(f"Validation epoch {epoch}")
 
@@ -147,9 +141,12 @@ def eval_model(
 
     batch_time = util.AverageMeter()
     data_time  = util.AverageMeter()
-    losses     = util.AverageMeter()
-    top1       = util.AverageMeter()
-    top5       = util.AverageMeter()
+
+    # Track sums and counts manually for correct all_reduce aggregation
+    loss_sum  = 0.0
+    top1_sum  = 0.0
+    top5_sum  = 0.0
+    n_samples = 0
 
     device   = next(model.parameters()).device
     end_time = time.time()
@@ -166,9 +163,12 @@ def eval_model(
                 loss    = criterion(outputs, targets)
 
             prec1, prec5 = util.calculate_accuracy(outputs, targets, topk=(1, 5))
-            losses.update(loss.item(), inputs.size(0))
-            top1.update(prec1, inputs.size(0))
-            top5.update(prec5, inputs.size(0))
+
+            batch_n    = inputs.size(0)
+            loss_sum  += loss.item()  * batch_n
+            top1_sum  += prec1        * batch_n
+            top5_sum  += prec5        * batch_n
+            n_samples += batch_n
 
             batch_time.update(time.time() - end_time)
             end_time = time.time()
@@ -178,25 +178,39 @@ def eval_model(
                     f"Val [{epoch}][{i}/{len(data_loader)}]  "
                     f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})  "
                     f"Data {data_time.val:.3f} ({data_time.avg:.3f})  "
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})  "
-                    f"Prec@1 {top1.val:.4f} ({top1.avg:.4f})  "
-                    f"Prec@5 {top5.val:.4f} ({top5.avg:.4f})"
+                    f"Loss {loss.item():.4f}  "
+                    f"Prec@1 {prec1:.4f}  "
+                    f"Prec@5 {prec5:.4f}"
                 )
+
+    # --- All-reduce across ranks ---
+    # Pack into a single tensor to minimize communication overhead
+    if world_size > 1:
+        stats = torch.tensor(
+            [loss_sum, top1_sum, top5_sum, float(n_samples)],
+            dtype=torch.float32,
+            device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        loss_sum, top1_sum, top5_sum, n_samples = stats.tolist()
+
+    loss_avg = loss_sum / n_samples
+    top1_avg = top1_sum / n_samples
+    top5_avg = top5_sum / n_samples
 
     if is_main:
         val_logger.log({
             'epoch': epoch,
-            'loss':  losses.avg,
-            'prec1': top1.avg,
-            'prec5': top5.avg,
+            'loss':  loss_avg,
+            'prec1': top1_avg,
+            'prec5': top5_avg,
         })
 
-    return losses.avg, top1.avg
+    return loss_avg, top1_avg
 
 
-# ---------------------------------------------------------------------------
+
 # Main
-# ---------------------------------------------------------------------------
 
 def main(opt):
     # torchrun sets LOCAL_RANK and WORLD_SIZE automatically
@@ -218,7 +232,7 @@ def main(opt):
         torch.distributed.init_process_group(
             backend="nccl",
             init_method="env://",
-            # timeout=datetime.timedelta(minutes=20)
+            timeout=datetime.timedelta(minutes=20)
         )
 
     device = torch.device(f'cuda:{rank}')
@@ -266,7 +280,8 @@ def main(opt):
             logger.info(f"Resuming from checkpoint: {opt.resume_path}")
         checkpoint  = torch.load(opt.resume_path, map_location=device, weights_only=True)
         assert opt.arch == checkpoint['arch'], "Architecture mismatch in checkpoint"
-        best_prec1  = checkpoint['best_prec1']
+        if is_main:                              # ← only rank 0 needs this
+            best_prec1 = checkpoint['best_prec1']
         begin_epoch = checkpoint['epoch'] + 1
         model.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -284,23 +299,25 @@ def main(opt):
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=opt.num_workers,
-        persistent_workers=True,
+        persistent_workers=opt.num_workers > 0, # True - avoiding re-fork overhead and importantly keeping _envs LMDB handles warm across epochs
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=2 if opt.num_workers > 0 else None, # how many batches each worker prepares ahead of time in its own queue
     )
 
-    # ---- Validation data loader (main rank only) ----
-    val_loader = None
-    if is_main:
-        val_data   = get_validation_set(opt)
-        val_loader = DataLoader(
-            val_data,
-            batch_size=opt.batch_size,
-            shuffle=False,
-            num_workers=opt.num_workers,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+    # ---- Validation data loader (all ranks) ----
+    val_data    = get_validation_set(opt)
+    val_sampler = DistributedSampler(val_data, shuffle=False, drop_last=True) if is_distributed else None
+    val_loader  = DataLoader(
+        val_data,
+        batch_size=opt.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=opt.num_workers,
+        persistent_workers=opt.num_workers > 0,
+        pin_memory=True,
+        prefetch_factor=2 if opt.num_workers > 0 else None,
+    )
 
     # ---- Loggers (main process only) ----
     train_logger = train_batch_logger = val_logger = None
@@ -334,27 +351,26 @@ def main(opt):
             is_main=is_main,
         )
 
-        # Sync immediately after training, before rank 0 goes into validation
+        # Sync
         if is_distributed:
             dist.barrier()
 
         scheduler.step()
 
-        # Validation runs on main rank (single GPU) only
-        if is_main:
-            val_model = model.module if isinstance(model, DDP) else model
+        # Validation runs on ALL ranks
+        val_model = model.module if isinstance(model, DDP) else model
 
-            val_loss, prec1 = eval_model(
-                epoch, val_loader, val_model, criterion,
-                opt, val_logger,
-                is_main=is_main,
-            )
+        _, prec1 = eval_model(
+            epoch, val_loader, val_model, criterion,
+            opt, val_logger,
+            rank=rank,
+            world_size=world_size,
+        )
+
+        # Only rank 0 decides best and saves
+        if is_main:
             is_best    = prec1 > best_prec1
             best_prec1 = max(prec1, best_prec1)
-
-        # Second barrier before next epoch starts
-        if is_distributed:
-            dist.barrier()
 
         if is_main:
             state = {
@@ -367,6 +383,10 @@ def main(opt):
                 'best_prec1': best_prec1,
             }
             util.save_checkpoint(state, is_best, opt)
+            
+        # Second barrier before next epoch starts
+        if is_distributed:
+            dist.barrier()
 
     if is_main:
         train_logger.close()
@@ -377,15 +397,15 @@ def main(opt):
         dist.destroy_process_group()
 
 
-# ---------------------------------------------------------------------------
+
 # Entry point
-# ---------------------------------------------------------------------------
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Paths
-    parser.add_argument('--root_path',      default='/mnt/HDD10TB/kinetics600', type=str)
+    parser.add_argument('--root_path',      default='/mnt/HDD10TB/kinetics600_lmdb', type=str)
     parser.add_argument('--result_path',    default='results',             type=str)
     parser.add_argument('--resume_path',    default='',                    type=str)
     parser.add_argument('--pretrain_path',  default='',                    type=str)
@@ -394,14 +414,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_classes',     default=600,  type=int)
     parser.add_argument('--sample_duration', default=16,   type=int)
     parser.add_argument('--sampling_step', default=1,    type=int)
-    parser.add_argument('--input_size', default=224,  type=int)
+    parser.add_argument('--input_size', default=112,  type=int)
 
     # Model
     parser.add_argument('--model', default='shufflenetv2', type=str)
     parser.add_argument('--width_mult', default=2.0, type=float)
 
     # Training
-    parser.add_argument('--batch_size',     default=60,   type=int)
+    parser.add_argument('--batch_size',     default=20,   type=int)
     parser.add_argument('--n_epochs',       default=100,  type=int)
     parser.add_argument('--begin_epoch',    default=1,    type=int)
     parser.add_argument('--learning_rate',  default=0.01, type=float)
@@ -413,10 +433,10 @@ if __name__ == '__main__':
     parser.add_argument('--manual_seed',    default=42,   type=int)
 
     # AMP / compile
-    parser.add_argument('--amp',     action='store_true', default=True,  help='Enable mixed precision')
+    parser.add_argument('--amp', action='store_true', default=False,  help='Enable mixed precision')
 
     # Misc
-    parser.add_argument('--num_workers',  default=4,  type=int)
+    parser.add_argument('--num_workers',  default=8,  type=int)
     parser.add_argument('--log_interval', default=1000, type=int, help='Log every N batches')
 
     opt = parser.parse_args()
@@ -432,5 +452,6 @@ if __name__ == '__main__':
         json.dump(vars(opt), f, indent=2)
 
     torch.manual_seed(opt.manual_seed)
+    torch.cuda.manual_seed_all(opt.manual_seed)
 
     main(opt)
