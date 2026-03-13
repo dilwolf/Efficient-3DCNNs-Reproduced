@@ -5,6 +5,7 @@ Efficient frame-based Kinetics dataset loader
 import os
 import cv2
 import torch
+import pickle
 import random
 import logging
 import numpy as np
@@ -59,37 +60,55 @@ class Kinetics(data.Dataset):
         # logger.info(f"Dataset initialized: {len(self.samples)} samples from {len(self.class_to_idx)} classes")
     
     def _build_dataset(self):
-        """Build dataset by scanning directory structure"""
+        """Build dataset by scanning directory structure, or load from cache if available."""
         
         if not self.path.exists():
             raise FileNotFoundError(f"Root path does not exist: {self.path}")
         
-        # Get all class directories
-        class_dirs = sorted([d for d in self.path.iterdir() if d.is_dir()])
+        cache_path = self.path / "dataset_cache.pkl"
         
-        if not class_dirs:
-            raise ValueError(f"No class directories found in {self.path}")
-        
-        if len(class_dirs) != self.num_classes:
-            raise ValueError(f"The number of class folders: {len(class_dirs)} is not equal to expected number of classes: {self.num_classes}")
-        
-        # Create class mappings
-        self.class_to_idx = {cls_dir.name: idx for idx, cls_dir in enumerate(class_dirs)}
-        self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
-        
-        # Scan each class directory
-        for class_dir in class_dirs:
-            class_name = class_dir.name
-            class_idx = self.class_to_idx[class_name]
+        # Load from cache if available
+        if cache_path.exists():
+            with open(cache_path, 'rb') as f:
+                cached = pickle.load(f)
+                self.samples      = cached['samples']
+                self.class_to_idx = cached['class_to_idx']
+                self.idx_to_class = cached['idx_to_class']
+        else:
+            # Get all class directories
+            class_dirs = sorted([d for d in self.path.iterdir() if d.is_dir()])
             
-            # Get all video directories within this class
-            video_dirs = sorted([v for v in class_dir.iterdir() if v.is_dir()])
+            if not class_dirs:
+                raise ValueError(f"No class directories found in {self.path}")
             
-            for video_dir in video_dirs:
-                self._process_video_directory(video_dir, class_idx)
-        
-        if not self.samples:
-            raise ValueError(f"No valid samples found in {self.path}")
+            if len(class_dirs) != self.num_classes:
+                raise ValueError(f"The number of class folders: {len(class_dirs)} is not equal to expected number of classes: {self.num_classes}")
+            
+            # Create class mappings
+            self.class_to_idx = {cls_dir.name: idx for idx, cls_dir in enumerate(class_dirs)}
+            self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
+            
+            # Scan each class directory
+            for class_dir in class_dirs:
+                class_name = class_dir.name
+                class_idx = self.class_to_idx[class_name]
+                
+                # Get all video directories within this class
+                video_dirs = sorted([v for v in class_dir.iterdir() if v.is_dir()])
+                
+                for video_dir in video_dirs:
+                    self._process_video_directory(video_dir, class_idx)
+            
+            if not self.samples:
+                raise ValueError(f"No valid samples found in {self.path}")
+            
+            # Save cache for next run
+            with open(cache_path, 'wb') as f:
+                pickle.dump({
+                    'samples':      self.samples,
+                    'class_to_idx': self.class_to_idx,
+                    'idx_to_class': self.idx_to_class
+                }, f)
         
     def _get_frame_range(self, video_dir: str):
         min_idx = None
